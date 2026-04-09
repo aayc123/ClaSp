@@ -111,6 +111,7 @@ class LlamaAttention(_LlamaAttention):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # 新增参数
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -126,8 +127,8 @@ class LlamaAttention(_LlamaAttention):
         kv_seq_len = q_len
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[2]
-    
-        # 生成 position_ids
+
+        # 生成 position_ids（如果没有提供）
         if position_ids is None:
             if past_key_value is None:
                 position_ids = torch.arange(
@@ -139,13 +140,29 @@ class LlamaAttention(_LlamaAttention):
                     cache_len, cache_len + q_len, 
                     dtype=torch.long, device=query_states.device
                 ).unsqueeze(0)
+        
+        # 🔧 兼容新旧版本的 rotary_emb 调用
+        if position_embeddings is not None:
+            # 新版本：直接使用传入的 position_embeddings
+            cos, sin = position_embeddings
+        else:
+            # 旧版本：自己调用 rotary_emb
+            # 检查 rotary_emb 接受什么参数
+            import inspect
+            sig = inspect.signature(self.rotary_emb.forward)
             
-               
-        # 修复后的代码
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            if 'position_ids' in sig.parameters:
+                # 新版本 transformers (>= 4.36)
+                cos, sin = self.rotary_emb(value_states, position_ids)
+            elif 'seq_len' in sig.parameters:
+                # 旧版本 transformers
+                cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            else:
+                # 最新版本，只需要传入 tensor
+                cos, sin = self.rotary_emb(value_states, position_ids)
+        
         cos = cos.to(dtype=hidden_states.dtype)
         sin = sin.to(dtype=hidden_states.dtype)
-  
         
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -201,7 +218,6 @@ class LlamaAttention(_LlamaAttention):
 
         return attn_output, attn_weights, past_key_value
 
-
 class LlamaMLP(_LlamaMLP):
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -227,31 +243,18 @@ class LlamaDecoderLayer(nn.Module):
         draft_mlp_skip_mask: torch.Tensor = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        draft_mode: bool = False, 
+        draft_mode: bool = False,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # 🔧 新增
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-                (see `past_key_values`).
-            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
-        """
-
+        
         if self.training:
-
             if enabled_draft and draft_attn_skip_mask[self.layer_id].item():
                 pass
             else:
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
     
-                # Self Attention
+                # Self Attention - 🔧 添加 position_embeddings 参数
                 hidden_states, self_attn_weights, present_key_value = self.self_attn(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
@@ -259,6 +262,7 @@ class LlamaDecoderLayer(nn.Module):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    position_embeddings=position_embeddings,
                 )
                 hidden_states = residual + hidden_states
     
@@ -272,23 +276,15 @@ class LlamaDecoderLayer(nn.Module):
                 hidden_states = residual + hidden_states
 
         else:
-            
             residual = hidden_states
-            # if self.layer_id < 3 or self.layer_id in [10, 11, 13, 14, 16]:
-            #     print(f"  🔍 Layer {self.layer_id}: enabled_draft={enabled_draft}, in_skip_set={self.layer_id in _attn_skip_layer_id_set}")
             
             if enabled_draft and self.layer_id in _attn_skip_layer_id_set:
-                # if self.layer_id in [10, 11, 13, 14]:  # 只打印部分层避免刷屏
-                #     print(f"    ⚡⚡⚡ SKIPPING Attn Layer {self.layer_id} ⚡⚡⚡")
                 hidden_states = residual
                 present_key_value = None
             else:
-                # if self.layer_id < 3:
-                #     print(f"    ✅ Executing Attn Layer {self.layer_id} (Normal)")
-                
                 hidden_states = self.input_layernorm(hidden_states)
     
-                # Self Attention
+                # Self Attention - 🔧 添加 position_embeddings 参数
                 hidden_states, self_attn_weights, present_key_value = self.self_attn(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
@@ -296,6 +292,7 @@ class LlamaDecoderLayer(nn.Module):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    position_embeddings=position_embeddings,
                 )
                 
                 hidden_states = residual + hidden_states
@@ -304,8 +301,6 @@ class LlamaDecoderLayer(nn.Module):
             residual = hidden_states
             
             if enabled_draft and self.layer_id in _mlp_skip_layer_id_set:
-                # if self.layer_id in [15]:
-                #     print(f"    ⚡⚡⚡ SKIPPING MLP Layer {self.layer_id} ⚡⚡⚡")
                 hidden_states = residual
             else:
                 hidden_states = self.post_attention_layernorm(hidden_states)
@@ -313,10 +308,8 @@ class LlamaDecoderLayer(nn.Module):
                 hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
-
         if output_attentions:
             outputs += (self_attn_weights,)
-
         if use_cache:
             outputs += (present_key_value,)
 
@@ -324,13 +317,6 @@ class LlamaDecoderLayer(nn.Module):
         
 
 class LlamaModel(_LlamaModel):
-    """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
-
-    Args:
-        config: LlamaConfig
-    """
-
     def __init__(self, config: LlamaConfig):
         super(_LlamaModel, self).__init__(config)
         self.padding_idx = config.pad_token_id
@@ -339,9 +325,15 @@ class LlamaModel(_LlamaModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([LlamaDecoderLayer(config, layer_id=i) for i in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # 🔧 添加 rotary_emb（如果需要在模型层面计算）
+        # 注意：这是可选的，因为每个 attention 层都有自己的 rotary_emb
+        try:
+            self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        except:
+            self.rotary_emb = None
 
         self.gradient_checkpointing = True
-        # Initialize weights and apply final processing
         self.post_init()
 
     def forward(
@@ -420,6 +412,15 @@ class LlamaModel(_LlamaModel):
     
 
         hidden_states = inputs_embeds
+        
+        position_embeddings = None
+        if self.rotary_emb is not None:
+            try:
+                # 新版本 transformers 的调用方式
+                position_embeddings = self.rotary_emb(hidden_states, position_ids)
+            except:
+                # 如果失败，设为 None，让每层自己计算
+                position_embeddings = None
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -457,6 +458,7 @@ class LlamaModel(_LlamaModel):
                     past_key_value,
                     draft_attn_skip_mask,
                     draft_mlp_skip_mask,
+                    None
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -468,6 +470,7 @@ class LlamaModel(_LlamaModel):
                     use_cache=use_cache,
                     draft_attn_skip_mask=draft_attn_skip_mask,
                     draft_mlp_skip_mask=draft_mlp_skip_mask,
+                    position_embeddings=position_embeddings,
                 )
 
             hidden_states = layer_outputs[0]

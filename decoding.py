@@ -8,6 +8,11 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 import torch
 import torch.nn.functional as F
 import numpy as np
+import time
+from datetime import datetime
+import json
+import csv
+
 def top_k_top_p_filtering(
     logits: torch.FloatTensor,
     top_k: int = 0,
@@ -48,23 +53,32 @@ def top_k_top_p_filtering(
     
     return logits
 
-
-import time
-import torch
-import torch.nn as nn
-import time
-from datetime import datetime
-import json
-import csv
-
 def clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_stop=False,
-                   max_step_draft=8, num_skip_layers=15, update_interval=8,
+                   max_step_draft=8, num_skip_layers=11, update_interval=64,
                    do_sample=False, top_k=0, top_p=0.85, temperature=0.0,th_stop_draft=0.7,
                    log_file="clasp_timing_log.json"):
-    """
-    CLaSp: 动态层跳过的自推测解码
-    添加详细的时间记录功能
-    """
+    
+    
+    input_length = input_ids.shape[1]
+    fixed_skip_layers = [7, 9 ,10, 11, 13, 14, 18, 20, 22, 24, 26]
+    current_skip_layers= [7, 9 ,10, 11, 13, 14, 18, 20, 22, 24, 26]
+    fixed_mlp_skip = [7, 8, 11, 12, 15, 17, 19]
+    if input_length > 1000:  # 长输入
+        print("⚠️  Long input detected, adjusting parameters...")
+        max_step_draft = min(max_step_draft, 6)  # 减少draft步数
+        update_interval = 128  # 增加更新间隔
+        th_stop_draft = 0.6  # 降低阈值，更积极draft
+        #math适合这个跳层
+        # fixed_mlp_skip = [8, 11, 12, 15, 17]
+    elif input_length > 500:  # 中等输入
+        max_step_draft = min(max_step_draft, 8)
+        update_interval = 96
+        th_stop_draft = 0.65
+    
+    print(f"📋 Adjusted params: max_step_draft={max_step_draft}, "
+          f"update_interval={update_interval}, th_stop_draft={th_stop_draft}")
+    print(f"{'='*60}\n")
+    
     # 初始化时间记录数据结构
     timing_records = {
         "metadata": {
@@ -100,15 +114,13 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_stop=F
                                dtype=torch.long, device=model.device)
     past_key_values = None
     
-    fixed_skip_layers = [11, 14, 18, 22, 24, 25, 26]
-    current_skip_layers= [10, 11, 24, 25, 27, 28]
-    fixed_mlp_skip = [11, 14, 18, 22, 24, 25, 26]
     model.set_skip_layers(attn_skip_layer_id_set=fixed_skip_layers, 
                          mlp_skip_layer_id_set=fixed_mlp_skip)
     
     last_hidden_states = None
     step_accept_counts = []
     need_hidden_states = 0
+    last_match=-1
     with torch.no_grad():
         while True:
             if step >= max_new_tokens:
@@ -212,10 +224,9 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_stop=F
                     draft_kv_cache = draft_output['past_key_values']
                     
                     # 检查是否应该提前停止
+                    
                     if conf_value < th_stop_draft:
                         early_stopped = True
-                        # print(f"  ⚠️ Draft early stop at step {draft_step+1}: "
-                        #       f"confidence {conf_value:.3f} < threshold {th_stop_draft}")
                         break
                     
                     if step + draft_step + 2 >= max_new_tokens:
@@ -239,7 +250,7 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_stop=F
                 position_ids = torch.arange(
                     cache_len, cache_len + seq_len, dtype=torch.long, device=model.device
                 ).unsqueeze(0)
-                flag=True if need_hidden_states>=1 else False
+                flag=True if (update_counter+1) % update_interval==0 else False
                 output = model(input_ids=drafted_input_ids,
                                position_ids=position_ids,
                                past_key_values=past_key_values,
@@ -248,8 +259,7 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_stop=F
                                output_hidden_states=flag)
                 
                 logits = output['logits']
-                output_ids = sample(logits, do_sample=do_sample, top_k=top_k, 
-                                   top_p=top_p, temperature=temperature)
+                output_ids = sample(logits, do_sample=do_sample, top_k=top_k, top_p=top_p, temperature=temperature)
                 
                 # 检查匹配
                 max_matched = ((output_ids[:, :-1] != drafted_input_ids[:, 1:]).cumsum(-1) == 0).sum(-1).item() + 1
@@ -285,10 +295,11 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_stop=F
                     need_hidden_states=0
                 # ========== DP 阶段计时 ==========
                 dp_time = 0
-                # if update_counter % update_interval == 0:
-                if  need_hidden_states>=5 and update_counter<3:
-                    update_counter += 1
-                    # print("🔄 触发动态规划跳层优化")
+                update_counter += 1
+                if update_counter % update_interval == 0:
+                # if  need_hidden_states>=5 and update_counter<3:
+                    print(update_counter)
+                    print("🔄 触发动态规划跳层优化")
                     # if(need_hidden_states==0):
                     #     continue
                     dp_start = time.perf_counter()
@@ -320,7 +331,7 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_stop=F
                     #     new_skip_layers = dynamic_range[::step_size][:num_skip_layers]
                     
                     model.set_skip_layers(attn_skip_layer_id_set=new_skip_layers, 
-                                         mlp_skip_layer_id_set=[])
+                                         mlp_skip_layer_id_set=fixed_mlp_skip)
                     current_skip_layers = new_skip_layers
                 
                 round_timing["dp_time_ms"] = dp_time
@@ -339,9 +350,9 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_stop=F
                 ])
                 
                 # 打印当前轮次的时间统计
-                # print(f"\n[Round {n_rounds}] Draft: {draft_time:.2f}ms | "
-                #       f"Verify: {verify_time:.2f}ms | DP: {dp_time:.2f}ms | "
-                #       f"Drafted: {drafted_n_tokens} | Accepted: {max_matched-1}")
+                print(f"\n[Round {n_rounds}] Draft: {draft_time:.2f}ms | "
+                      f"Verify: {verify_time:.2f}ms | DP: {dp_time:.2f}ms | "
+                      f"Drafted: {drafted_n_tokens} | Accepted: {max_matched-1}")
             
             if early_stop and tokenizer.eos_token_id in output_ids[0].tolist():
                 break
@@ -390,22 +401,22 @@ def clasp_generate(model, tokenizer, input_ids, max_new_tokens=128, early_stop=F
     csv_file.close()
     
     # 打印总结
-    # print(f"\n{'='*60}")
-    # print(f"CLaSp生成完成:")
-    # print(f"  总tokens: {step}")
-    # print(f"  总时间: {total_time:.2f}ms")
-    # print(f"  Draft轮数: {n_rounds}")
-    # print(f"  总draft tokens: {n_drafted}")
-    # print(f"  总接受tokens: {n_matched}")
-    # print(f"  τ (平均接受长度): {tau:.3f}")
-    # print(f"  Matchness (接受率): {matchness:.3f}")
-    # print(f"\n时间统计:")
-    # print(f"  Draft总时间: {total_draft_time:.2f}ms")
-    # print(f"  Verify总时间: {total_verify_time:.2f}ms")
-    # print(f"  DP总时间: {total_dp_time:.2f}ms")
-    # print(f"  JSON日志保存到: {log_file}")
-    # print(f"  CSV日志保存到: {csv_filename}")
-    # print(f"{'='*60}\n")
+    print(f"\n{'='*60}")
+    print(f"CLaSp生成完成:")
+    print(f"  总tokens: {step}")
+    print(f"  总时间: {total_time:.2f}ms")
+    print(f"  Draft轮数: {n_rounds}")
+    print(f"  总draft tokens: {n_drafted}")
+    print(f"  总接受tokens: {n_matched}")
+    print(f"  τ (平均接受长度): {tau:.3f}")
+    print(f"  Matchness (接受率): {matchness:.3f}")
+    print(f"\n时间统计:")
+    print(f"  Draft总时间: {total_draft_time:.2f}ms")
+    print(f"  Verify总时间: {total_verify_time:.2f}ms")
+    print(f"  DP总时间: {total_dp_time:.2f}ms")
+    print(f"  JSON日志保存到: {log_file}")
+    print(f"  CSV日志保存到: {csv_filename}")
+    print(f"{'='*60}\n")
     
     return {
         'generate_ids': full_sequence,

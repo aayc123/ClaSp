@@ -19,10 +19,6 @@ class DynamicLayerOptimizer:
 
     @torch.inference_mode()
     def optimize_skip_layers_v2(self, last_hidden_states, past_key_values):
-        """
-        第四轮优化（保守版）：在 20ms 基础上做微调
-        目标：从 20ms 优化到 10-15ms
-        """
         L = self.num_layers
         
         # ====== 优化1：候选层筛选（保持原逻辑但微调）======
@@ -30,9 +26,7 @@ class DynamicLayerOptimizer:
         fixed_back = 10
         candidate_range = list(range(fixed_front, L - fixed_back))
         
-        # 候选层数量：在准确性和速度之间平衡
-        # 10 层是个甜蜜点
-        max_candidates = 10
+        max_candidates = 6
         step = max(1, len(candidate_range) // max_candidates)
         candidate_layers = candidate_range[::step][:max_candidates]
         
@@ -279,104 +273,3 @@ class DynamicLayerOptimizer:
         )
         
         return output[0].squeeze(0).squeeze(0)
-#     @torch.inference_mode()
-#     def optimize_skip_layers(self, last_hidden_states, past_key_values):
-#         """
-#         Args:
-#             last_hidden_states: [L+1, hidden_size] 目标隐藏状态 (Ground Truth)
-#             past_key_values: 每一层的 KV Cache，必须传入！
-#         """
-#         L = self.num_layers
-        
-#         # 存储每个层的决策和相似度
-#         decisions = []  # True表示跳过该层
-#         layer_similarities = []
-        
-#         # 初始状态
-#         current_state = last_hidden_states[0].clone()
-        
-#         for i in range(L):
-#             # 1. 计算执行当前层后的状态
-#             executed_state = self._forward_layer(
-#                 layer_idx=i,
-#                 hidden_state=current_state,
-#                 past_key_value=past_key_values[i]
-#             )
-            
-#             # 2. 计算相似度
-#             target = F.normalize(last_hidden_states[i+1], p=2, dim=-1)
-            
-#             norm_executed = F.normalize(executed_state, p=2, dim=-1)
-#             norm_current = F.normalize(current_state, p=2, dim=-1)
-            
-#             sim_execute = (norm_executed * target).sum(dim=-1)
-#             sim_skip = (norm_current * target).sum(dim=-1)
-            
-#             # 3. 决定是否跳过
-#             # 考虑额外奖励以鼓励跳过（如果有剩余跳层额度）
-#             remaining_skips = self.max_skip_layers - sum(decisions)
-#             if remaining_skips > 0:
-#                 # 动态调整阈值：剩余跳层越多，越容易跳过
-#                 dynamic_threshold = self.skip_threshold * (1.0 + 0.1 * remaining_skips)
-#             else:
-#                 dynamic_threshold = self.skip_threshold
-                
-#             do_skip = (sim_skip + dynamic_threshold) > sim_execute
-            
-#             # 如果已经跳过了太多层，强制执行
-#             if sum(decisions) >= self.max_skip_layers:
-#                 do_skip = False
-            
-#             # 4. 更新状态
-#             if do_skip:
-#                 # 跳过当前层，状态不变
-#                 decisions.append(True)
-#                 # current_state 保持不变
-#             else:
-#                 # 执行当前层
-#                 decisions.append(False)
-#                 current_state = executed_state
-            
-#             layer_similarities.append({
-#                 'execute': sim_execute.item(),
-#                 'skip': sim_skip.item(),
-#                 'decision': do_skip.item()
-#             })
-        
-#         # 收集跳过的层索引
-#         skip_layers = [i for i, skip in enumerate(decisions) if skip]
-        
-#         return skip_layers, layer_similarities
-
-#     def _forward_layer(self, layer_idx, hidden_state, past_key_value):
-#         """单层前向传播"""
-#         layer = self.model.model.layers[layer_idx]
-        
-#         # 准备输入
-#         # hidden_state: [hidden_size]
-#         h_seq = hidden_state.unsqueeze(0).unsqueeze(0)  # [1, 1, hidden_size]
-        
-#         # Position IDs
-#         past_len = past_key_value[0].shape[2]
-#         position_ids = torch.tensor([[past_len]], dtype=torch.long, device=self.device)
-        
-#         # Attention mask
-#         total_len = past_len + 1
-#         mask = torch.zeros((1, 1, 1, total_len), device=self.device, dtype=self.dtype)
-#         mask_val = torch.finfo(self.dtype).min
-        
-#         # 只能看到历史和自己，看不到其他候选
-#         if total_len > past_len + 1:
-#             mask[:, :, :, past_len+1:] = mask_val
-        
-#         # 前向传播
-#         output = layer(
-#             h_seq,
-#             attention_mask=mask,
-#             position_ids=position_ids,
-#             past_key_value=past_key_value,
-#             use_cache=False
-#         )
-        
-#         return output[0].squeeze(0).squeeze(0)
-    
